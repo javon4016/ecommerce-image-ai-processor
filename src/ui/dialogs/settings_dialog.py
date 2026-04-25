@@ -284,6 +284,7 @@ class AISettingsWidget(QWidget):
         self._model_combo = QComboBox()
         # 只显示支持 base64 data URL 的模型
         self._model_combo.addItems([
+            "qwen-image-2.0",
             "qwen-image-edit-plus",
             "qwen-image-edit-plus-2025-12-15",
             "qwen-image-edit-plus-2025-10-30",

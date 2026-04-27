@@ -19,10 +19,11 @@
 
 from __future__ import annotations
 
+from enum import Enum, auto
 from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import Qt, pyqtSignal, QSize, QEvent
+from PyQt6.QtCore import Qt, pyqtSignal, QSize, QEvent, QTimer
 from PyQt6.QtGui import QAction, QKeySequence, QCloseEvent, QResizeEvent
 from PyQt6.QtWidgets import (
     QApplication,
@@ -98,6 +99,14 @@ from src.utils.logger import setup_logger
 logger = setup_logger(__name__)
 
 
+class ProcessingRunState(Enum):
+    """主窗口处理流程 UI 状态机（与后台协作式暂停/取消配合）."""
+
+    IDLE = auto()
+    PROCESSING = auto()
+    PAUSING = auto()  # 已请求暂停，等待当前阶段结束
+    PAUSED = auto()
+    CANCELLING = auto()  # 已请求取消，等待当前阶段结束
 
 
 class MainWindow(QMainWindow):
@@ -135,8 +144,19 @@ class MainWindow(QMainWindow):
         # 状态属性
         self._is_processing: bool = False
         self._is_paused: bool = False
+        self._is_cancelling: bool = False
+        self._run_state: ProcessingRunState = ProcessingRunState.IDLE
         self._queue_count: int = 0
         self._current_progress: int = 0
+
+        # 暂停：当前步骤结束后才切换到「已暂停」展示，避免与进度条冲突
+        self._pause_settle_timer = QTimer(self)
+        self._pause_settle_timer.setSingleShot(True)
+        self._pause_settle_timer.timeout.connect(self._on_pause_settled)
+        # 取消：长时间未结束时提示强制结束
+        self._cancel_watch_timer = QTimer(self)
+        self._cancel_watch_timer.setSingleShot(True)
+        self._cancel_watch_timer.timeout.connect(self._on_cancel_watch_timeout)
 
         # UI 组件引用
         self._toolbar: Optional[QToolBar] = None
@@ -572,6 +592,7 @@ class MainWindow(QMainWindow):
         self._queue_controller.task_progress.connect(self._on_queue_task_progress)
         self._queue_controller.task_completed.connect(self._on_queue_task_completed)
         self._queue_controller.task_failed.connect(self._on_queue_task_failed)
+        self._queue_controller.task_cancelled.connect(self._on_queue_task_cancelled)
         self._queue_controller.all_completed.connect(self._on_queue_completed)
         self._queue_controller.error_occurred.connect(self._on_queue_error)
 
@@ -711,32 +732,139 @@ class MainWindow(QMainWindow):
             output=output_config,
         )
 
+    def _toolbar_phase(self) -> str:
+        """工具栏进度条旁文案阶段（与 ToolbarQueueProgress.ui_phase 对齐）."""
+        if self._run_state == ProcessingRunState.PAUSING:
+            return "pausing"
+        if self._run_state == ProcessingRunState.CANCELLING:
+            return "cancelling"
+        return ""
+
+    def _set_run_state(
+        self,
+        state: ProcessingRunState,
+        *,
+        status_message: Optional[str] = None,
+        reset_progress_to_zero: bool = False,
+    ) -> None:
+        """统一切换 RunState，并同步工具栏进度与按钮."""
+        self._run_state = state
+        if state == ProcessingRunState.IDLE:
+            self._pause_settle_timer.stop()
+            self._cancel_watch_timer.stop()
+            self._is_processing = False
+            self._is_paused = False
+            self._is_cancelling = False
+            if self._toolbar_progress:
+                self._toolbar_progress.set_processing_state(False, False, "")
+            self._update_actions_state()
+            self.update_progress(0, status_message if status_message is not None else "就绪")
+            return
+
+        self._is_processing = True
+        self._is_paused = state == ProcessingRunState.PAUSED
+        if self._toolbar_progress:
+            self._toolbar_progress.set_processing_state(
+                True, self._is_paused, self._toolbar_phase()
+            )
+        self._update_actions_state()
+        if status_message is not None:
+            prog = 0 if reset_progress_to_zero else self._current_progress
+            self.update_progress(prog, status_message)
+
+    def _decorate_progress_message(self, message: str) -> str:
+        """在暂停中/取消中阶段为底部进度文案加上一致语义."""
+        if self._run_state == ProcessingRunState.PAUSING:
+            return f"{message} · 将暂停" if message else "暂停中（等待当前步骤完成）"
+        if self._run_state == ProcessingRunState.CANCELLING:
+            return f"{message} · 取消中" if message else "取消中（等待当前步骤结束）"
+        return message
+
+    def _on_pause_settled(self) -> None:
+        """协作式暂停：当前阶段结束后将 UI 切到「已暂停」，避免与进度条冲突."""
+        if self._run_state != ProcessingRunState.PAUSING:
+            return
+        self._set_run_state(
+            ProcessingRunState.PAUSED,
+            status_message="已暂停（点击「继续」恢复处理）",
+        )
+
+    def _on_cancel_watch_timeout(self) -> None:
+        """取消长时间未结束时提示强制结束."""
+        if self._run_state != ProcessingRunState.CANCELLING:
+            return
+        reply = QMessageBox.question(
+            self,
+            "取消耗时较长",
+            "取消已等待较长时间仍未结束，是否强制结束后台任务？\n"
+            "（未完成项将标记为已取消）",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self._force_stop_processing(reason="用户确认强制结束")
+
+    def _force_stop_processing(
+        self,
+        reason: str = "",
+        *,
+        silent: bool = False,
+        emit_cancelled: bool = True,
+    ) -> None:
+        """强制停止队列线程并将未完成任务标记为已取消."""
+        self._pause_settle_timer.stop()
+        self._cancel_watch_timer.stop()
+        if self._queue_controller:
+            self._queue_controller.stop()
+        self._is_cancelling = False
+        for tid, t in list(self._tasks.items()):
+            if t.status in (TaskStatus.PENDING, TaskStatus.PROCESSING):
+                t.mark_cancelled()
+                if self._task_list_widget:
+                    self._task_list_widget.update_task_status(tid, TaskStatus.CANCELLED)
+        if silent:
+            self._set_run_state(ProcessingRunState.IDLE, status_message="就绪")
+        else:
+            tip = "后台已强制结束"
+            if reason:
+                tip = f"{tip}：{reason}"
+            self._set_run_state(ProcessingRunState.IDLE, status_message="已强制结束")
+            self.show_warning("处理已终止", tip)
+        if emit_cancelled:
+            self.process_cancelled.emit()
+
     def _update_actions_state(self) -> None:
         """更新操作按钮状态."""
         has_queue = self._queue_count > 0
-        is_idle = not self._is_processing
+        st = self._run_state
+        idle_like = st == ProcessingRunState.IDLE
 
-        # 开始 - 有队列且非处理中可用
         if self._action_start:
-            self._action_start.setEnabled(has_queue and is_idle)
+            self._action_start.setEnabled(has_queue and idle_like)
 
-        # 暂停 - 处理中且未暂停可用
         if self._action_pause:
-            self._action_pause.setEnabled(self._is_processing and not self._is_paused)
-            if self._is_paused:
-                self._action_pause.setText("继续")
+            if st in (ProcessingRunState.PROCESSING, ProcessingRunState.PAUSED):
+                self._action_pause.setEnabled(True)
+                self._action_pause.setText("继续" if st == ProcessingRunState.PAUSED else "暂停")
             else:
+                self._action_pause.setEnabled(False)
                 self._action_pause.setText("暂停")
 
-        # 取消 - 处理中可用
         if self._action_cancel:
-            self._action_cancel.setEnabled(self._is_processing)
+            self._action_cancel.setEnabled(
+                st
+                in (
+                    ProcessingRunState.PROCESSING,
+                    ProcessingRunState.PAUSING,
+                    ProcessingRunState.PAUSED,
+                )
+            )
 
-        # 清空 - 有队列且非处理中可用
         if self._action_clear:
-            self._action_clear.setEnabled(has_queue and is_idle)
+            self._action_clear.setEnabled(
+                has_queue and (idle_like or st == ProcessingRunState.CANCELLING)
+            )
 
-        # 导出 - 有完成的结果可用（暂时禁用）
         if self._action_export:
             self._action_export.setEnabled(False)
 
@@ -779,20 +907,26 @@ class MainWindow(QMainWindow):
     def set_processing_state(self, is_processing: bool, is_paused: bool = False) -> None:
         """设置处理状态.
 
+        供测试与少量内部路径使用；常规流程由 _set_run_state 驱动。
+
         Args:
             is_processing: 是否正在处理
             is_paused: 是否已暂停
         """
-        self._is_processing = is_processing
-        self._is_paused = is_paused
-        self._update_actions_state()
-
-        # 同步工具栏进度状态
-        if self._toolbar_progress:
-            self._toolbar_progress.set_processing_state(is_processing, is_paused)
-
         if not is_processing:
-            self.update_progress(0, "就绪")
+            self._pause_settle_timer.stop()
+            self._cancel_watch_timer.stop()
+            self._set_run_state(ProcessingRunState.IDLE)
+            return
+
+        self._is_cancelling = False
+        self._cancel_watch_timer.stop()
+        if is_paused:
+            self._pause_settle_timer.stop()
+            self._set_run_state(ProcessingRunState.PAUSED)
+        else:
+            self._pause_settle_timer.stop()
+            self._set_run_state(ProcessingRunState.PROCESSING)
 
     def show_status_message(self, message: str, timeout: int = 3000) -> None:
         """在状态栏显示临时消息.
@@ -914,45 +1048,39 @@ class MainWindow(QMainWindow):
             return
         
         logger.info(f"开始处理，总任务: {len(self._tasks)}, 待处理: {len(pending_tasks)}")
-
-        # 从右侧面板收集当前配置并应用到待处理的任务
-        current_config = self._collect_current_config()
-        for task in pending_tasks.values():
-            task.config = current_config
-
-        # 从配置中获取并发数
-        config_manager = get_config()
-        concurrent_limit = config_manager.settings.concurrent_limit
-
-        # 传递待处理的任务给控制器
-        self._queue_controller.set_tasks(pending_tasks)
-        self._queue_controller.set_concurrent_limit(concurrent_limit)
-        self._queue_controller.start()
-
-        self.set_processing_state(True)
-        self.process_started.emit()
-        self.update_progress(0, "正在处理...")
-        logger.info("开始处理队列")
+        self._start_processing_tasks(pending_tasks, "正在处理...")
 
     def _on_pause_process(self) -> None:
         """暂停/继续处理."""
         if not self._queue_controller:
             return
 
-        if self._is_paused:
-            # 继续处理
+        if self._run_state == ProcessingRunState.PAUSED:
+            self._pause_settle_timer.stop()
             self._queue_controller.resume()
-            self.set_processing_state(True, False)
+            self._set_run_state(
+                ProcessingRunState.PROCESSING,
+                status_message="正在处理...",
+            )
             self.process_started.emit()  # 复用开始信号
-            self.update_progress(self._current_progress, "正在处理...")
             logger.info("继续处理")
-        else:
-            # 暂停处理
+        elif self._run_state == ProcessingRunState.PROCESSING:
             self._queue_controller.pause()
-            self.set_processing_state(True, True)
+            self._run_state = ProcessingRunState.PAUSING
+            self._is_processing = True
+            self._is_paused = False
+            if self._toolbar_progress:
+                self._toolbar_progress.set_processing_state(True, False, "pausing")
+            self._update_actions_state()
+            self.update_progress(
+                self._current_progress,
+                "暂停中（当前步骤完成后将暂停）",
+            )
+            self._pause_settle_timer.start(1200)
             self.process_paused.emit()
-            self.update_progress(self._current_progress, "已暂停")
-            logger.info("暂停处理")
+            logger.info("请求暂停（协作式）")
+        else:
+            logger.debug("忽略暂停：当前状态 %s", self._run_state)
 
     def _on_cancel_process(self) -> None:
         """取消处理."""
@@ -967,25 +1095,39 @@ class MainWindow(QMainWindow):
         if reply == QMessageBox.StandardButton.Yes:
             if self._queue_controller:
                 self._queue_controller.cancel()
-            self.set_processing_state(False)
-            self.process_cancelled.emit()
-            self.update_progress(0, "已取消")
-            logger.info("取消处理")
+            self._is_cancelling = True
+            self._pause_settle_timer.stop()
+            self._set_run_state(
+                ProcessingRunState.CANCELLING,
+                status_message="取消中（当前步骤完成后将停止）",
+            )
+            self._cancel_watch_timer.start(30_000)
+            self.show_status_message("正在取消任务，请稍候...")
+            logger.info("取消处理中任务")
 
     def _on_clear_queue(self) -> None:
         """清空队列."""
         if self._queue_count == 0:
             return
 
+        extra = ""
+        if self._run_state == ProcessingRunState.CANCELLING:
+            extra = "\n\n将强制终止后台处理并清空队列。"
         reply = QMessageBox.question(
             self,
             "确认清空",
-            f"确定要清空队列中的 {self._queue_count} 个任务吗？",
+            f"确定要清空队列中的 {self._queue_count} 个任务吗？{extra}",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
 
         if reply == QMessageBox.StandardButton.Yes:
+            if self._run_state == ProcessingRunState.CANCELLING:
+                self._force_stop_processing(
+                    reason="清空队列",
+                    silent=True,
+                    emit_cancelled=False,
+                )
             # 清空任务
             self._tasks.clear()
             self._selected_task_id = None
@@ -1110,6 +1252,10 @@ class MainWindow(QMainWindow):
         Args:
             task_id: 任务 ID
         """
+        if self._is_processing:
+            self.show_warning("请稍候", "当前正在处理任务，请完成或取消后再重试。")
+            return
+
         # 重置任务状态
         if task_id in self._tasks:
             task = self._tasks[task_id]
@@ -1122,8 +1268,9 @@ class MainWindow(QMainWindow):
             if self._task_list_widget:
                 self._task_list_widget.update_task_status(task_id, TaskStatus.PENDING)
 
-            self.show_status_message(f"任务已重置: {task.first_image_filename}")
-            logger.info(f"重试任务: {task_id}")
+            self.show_status_message(f"正在重试: {task.first_image_filename}")
+            logger.info(f"手动重试任务: {task_id}")
+            self._start_processing_tasks({task_id: task}, "正在重试任务...")
         else:
             logger.warning(f"任务不存在: {task_id}")
 
@@ -1153,6 +1300,8 @@ class MainWindow(QMainWindow):
             task_id: 任务 ID
             progress: 进度 (0-100)
         """
+        if self._run_state == ProcessingRunState.PAUSED:
+            return
         # 更新任务进度
         if task_id in self._tasks:
             self._tasks[task_id].progress = progress
@@ -1168,8 +1317,10 @@ class MainWindow(QMainWindow):
             progress: 进度百分比 (0-100)
             message: 状态消息
         """
+        if self._run_state == ProcessingRunState.PAUSED:
+            return
         self._current_progress = progress
-        self.update_progress(progress, message)
+        self.update_progress(progress, self._decorate_progress_message(message))
 
     def _on_queue_task_completed(self, task_id: str, output_path: str) -> None:
         """队列任务完成回调.
@@ -1223,6 +1374,17 @@ class MainWindow(QMainWindow):
 
         logger.error(f"任务失败: {task_id} - {error}")
 
+    def _on_queue_task_cancelled(self, task_id: str) -> None:
+        """队列任务取消回调."""
+        if task_id in self._tasks:
+            self._tasks[task_id].status = TaskStatus.CANCELLED
+            self._tasks[task_id].error_message = None
+
+        if self._task_list_widget:
+            self._task_list_widget.update_task_status(task_id, TaskStatus.CANCELLED)
+
+        logger.info(f"任务已取消: {task_id}")
+
     def _on_queue_completed(self, stats: QueueStats) -> None:
         """队列处理完成回调.
 
@@ -1230,6 +1392,9 @@ class MainWindow(QMainWindow):
             stats: 队列统计信息
         """
         logger.info(f"_on_queue_completed called: stats={stats}")
+        was_cancelling = self._is_cancelling
+        self._pause_settle_timer.stop()
+        self._cancel_watch_timer.stop()
         self.set_processing_state(False)
         
         # 显示完成消息
@@ -1237,7 +1402,19 @@ class MainWindow(QMainWindow):
         failed_count = stats.failed
         total = stats.total
         
-        if failed_count == 0:
+        if was_cancelling:
+            # 同步刷新取消状态，避免未触发单任务回调时 UI 仍显示旧状态
+            if self._task_list_widget:
+                for task_id, task in self._tasks.items():
+                    if task.status == TaskStatus.CANCELLED:
+                        self._task_list_widget.update_task_status(task_id, TaskStatus.CANCELLED)
+            self.process_cancelled.emit()
+            self.show_info(
+                "处理已取消",
+                f"已完成 {success_count}/{total} 个，取消 {stats.cancelled} 个"
+            )
+            self.update_progress(0, "已取消")
+        elif failed_count == 0:
             self.show_success(
                 "处理完成",
                 f"成功处理 {success_count}/{total} 个任务"
@@ -1248,7 +1425,8 @@ class MainWindow(QMainWindow):
                 f"完成 {success_count}/{total} 个，失败 {failed_count} 个"
             )
 
-        self.update_progress(100, f"已完成: {success_count}/{total}")
+        if not was_cancelling:
+            self.update_progress(100, f"已完成: {success_count}/{total}")
         logger.info(f"队列处理完成: 成功 {success_count}, 失败 {failed_count}")
 
     def _on_queue_error(self, exception: Exception) -> None:
@@ -1260,6 +1438,40 @@ class MainWindow(QMainWindow):
         self.set_processing_state(False)
         self.handle_exception(exception, show_dialog=True)
         logger.exception(f"队列处理错误: {exception}")
+
+    def _start_processing_tasks(
+        self,
+        tasks: dict[str, ImageTask],
+        status_message: str,
+    ) -> None:
+        """启动指定任务集合的处理流程."""
+        if not self._queue_controller:
+            logger.error("队列控制器未初始化")
+            return
+
+        current_config = self._collect_current_config()
+        for task in tasks.values():
+            task.config = current_config
+
+        config_manager = get_config()
+        concurrent_limit = config_manager.settings.concurrent_limit
+        if len(tasks) == 1:
+            concurrent_limit = 1
+
+        self._queue_controller.set_tasks(tasks)
+        self._queue_controller.set_concurrent_limit(concurrent_limit)
+        self._queue_controller.start()
+
+        self._is_cancelling = False
+        self._pause_settle_timer.stop()
+        self._cancel_watch_timer.stop()
+        self._set_run_state(
+            ProcessingRunState.PROCESSING,
+            status_message=status_message,
+            reset_progress_to_zero=True,
+        )
+        self.process_started.emit()
+        logger.info(f"开始处理任务集合: {len(tasks)} 个")
 
     def _on_settings(self) -> None:
         """打开设置对话框."""
@@ -1336,7 +1548,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event: QCloseEvent) -> None:
         """窗口关闭事件."""
-        if self._is_processing:
+        if self._run_state != ProcessingRunState.IDLE:
             reply = QMessageBox.question(
                 self,
                 "确认退出",
@@ -1349,10 +1561,11 @@ class MainWindow(QMainWindow):
                 event.ignore()
                 return
 
-            # 停止队列控制器
-            if self._queue_controller:
-                self._queue_controller.stop()
-            self.process_cancelled.emit()
+            self._force_stop_processing(
+                reason="退出应用",
+                silent=True,
+                emit_cancelled=True,
+            )
 
         logger.info("主窗口关闭")
         event.accept()

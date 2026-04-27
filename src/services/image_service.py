@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from typing import Callable, Optional, Tuple, Union
+from typing import Awaitable, Callable, Optional, Tuple, Union
 
 from PIL import Image
 
@@ -309,6 +309,7 @@ class ImageService:
         task: ImageTask,
         config: Optional[ProcessConfig] = None,
         on_progress: Optional[ProgressCallback] = None,
+        pause_check: Optional[Callable[[], Awaitable[None]]] = None,
     ) -> ImageTask:
         """处理完整的图片任务.
 
@@ -338,17 +339,22 @@ class ImageService:
             if on_progress:
                 on_progress(progress, message)
 
+        async def run_pause_check() -> None:
+            if pause_check:
+                await pause_check()
+
         try:
+            await run_pause_check()
             # 根据图片数量选择处理流程
             if task.is_single_image_mode:
                 # 单图模式（1张图片）
                 return await self._process_single_image_task(
-                    task, config, report_progress
+                    task, config, report_progress, run_pause_check
                 )
             else:
                 # 多图合成模式（2-3张图片）
                 return await self._process_multi_image_task(
-                    task, config, report_progress
+                    task, config, report_progress, run_pause_check
                 )
 
         except Exception as e:
@@ -361,6 +367,7 @@ class ImageService:
         task: ImageTask,
         config: ProcessConfig,
         report_progress: Callable[[int, str], None],
+        pause_check: Optional[Callable[[], Awaitable[None]]] = None,
     ) -> ImageTask:
         """处理多图合成任务（2-3张图片）.
         
@@ -372,6 +379,8 @@ class ImageService:
         5. 保存输出
         """
         # Step 1: AI 多图合成 (0-50%)
+        if pause_check:
+            await pause_check()
         report_progress(5, f"AI {task.image_count}图合成中")
         composite_result = await self._composite_multiple_images(
             task.image_paths,
@@ -381,6 +390,8 @@ class ImageService:
 
         # Step 2: 可选的抠图 + 背景填充 (50-65%)
         if config.background.enabled:
+            if pause_check:
+                await pause_check()
             report_progress(52, "抠图处理中")
             # 保存临时文件用于抠图
             import tempfile
@@ -394,6 +405,8 @@ class ImageService:
                 lambda p, m: report_progress(int(52 + p * 0.08), m),
             )
             
+            if pause_check:
+                await pause_check()
             report_progress(62, "背景填充")
             composite_result = await self._apply_background_to_scene(
                 composite_result,
@@ -409,6 +422,8 @@ class ImageService:
 
         # Step 3: 可选的 AI 增强 (65-80%)
         if config.ai_editing.enabled:
+            if pause_check:
+                await pause_check()
             report_progress(67, "AI 增强处理中")
             composite_result = await self._apply_ai_enhance(
                 composite_result,
@@ -419,6 +434,8 @@ class ImageService:
             report_progress(80, "跳过 AI 增强")
 
         # Step 4: 后期处理 (80-95%)
+        if pause_check:
+            await pause_check()
         report_progress(82, "后期处理")
         final_image = await self._apply_final_effects(
             composite_result,
@@ -427,6 +444,8 @@ class ImageService:
         )
 
         # Step 5: 保存输出 (95-100%)
+        if pause_check:
+            await pause_check()
         report_progress(96, "保存输出")
         output_path = await self._save_final_output(
             final_image,
@@ -446,6 +465,7 @@ class ImageService:
         task: ImageTask,
         config: ProcessConfig,
         report_progress: Callable[[int, str], None],
+        pause_check: Optional[Callable[[], Awaitable[None]]] = None,
     ) -> ImageTask:
         """处理单图任务（仅1张图片）.
         
@@ -457,6 +477,8 @@ class ImageService:
         5. 保存输出
         """
         # Step 1: 加载图片 (0-10%)
+        if pause_check:
+            await pause_check()
         report_progress(5, "加载图片")
         image = load_image(task.first_image_path)
         image = ensure_rgba(image)
@@ -465,6 +487,8 @@ class ImageService:
         # Step 2: 可选的抠图 + 背景填充 (10-40%)
         if config.background.enabled:
             # 抠图
+            if pause_check:
+                await pause_check()
             report_progress(10, "抠图处理中")
             image_bytes = await self._remove_scene_background(
                 task.first_image_path,
@@ -473,6 +497,8 @@ class ImageService:
             )
             
             # 背景填充
+            if pause_check:
+                await pause_check()
             report_progress(30, "背景填充")
             image_bytes = await self._apply_background_to_scene(
                 image_bytes,
@@ -484,6 +510,8 @@ class ImageService:
 
         # Step 3: 可选的 AI 增强 (40-70%)
         if config.ai_editing.enabled:
+            if pause_check:
+                await pause_check()
             report_progress(45, "AI 增强处理中")
             image_bytes = await self._apply_ai_enhance(
                 image_bytes,
@@ -494,6 +522,8 @@ class ImageService:
             report_progress(70, "跳过 AI 增强")
 
         # Step 4: 后期处理 (70-90%)
+        if pause_check:
+            await pause_check()
         report_progress(75, "后期处理")
         final_image = await self._apply_final_effects(
             image_bytes,
@@ -502,6 +532,8 @@ class ImageService:
         )
 
         # Step 5: 保存输出 (90-100%)
+        if pause_check:
+            await pause_check()
         report_progress(95, "保存输出")
         output_path = await self._save_final_output(
             final_image,

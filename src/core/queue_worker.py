@@ -18,7 +18,7 @@ from PyQt6.QtCore import QObject, QThread, pyqtSignal, pyqtSlot
 
 from src.core.batch_processor import BatchProcessor
 from src.models.batch_queue import BatchTask, QueueStats
-from src.models.image_task import ImageTask
+from src.models.image_task import ImageTask, TaskStatus
 from src.models.process_config import ProcessConfig
 from src.services.image_service import ImageService, get_image_service
 from src.utils.logger import setup_logger
@@ -46,6 +46,7 @@ class QueueWorker(QObject):
     task_progress = pyqtSignal(str, int, str)  # task_id, progress, message
     task_completed = pyqtSignal(str, str)  # task_id, output_path
     task_failed = pyqtSignal(str, str)  # task_id, error_message
+    task_cancelled = pyqtSignal(str)  # task_id
     queue_progress = pyqtSignal(object)  # QueueStats
     queue_completed = pyqtSignal(object)  # QueueStats
     error_occurred = pyqtSignal(object)  # Exception
@@ -168,6 +169,9 @@ class QueueWorker(QObject):
             elif task.is_failed:
                 logger.info(f"Emitting task_failed signal for {task.id}")
                 self.task_failed.emit(task.id, task.error_message or "未知错误")
+            elif task.status == TaskStatus.CANCELLED:
+                logger.info(f"Emitting task_cancelled signal for {task.id}")
+                self.task_cancelled.emit(task.id)
 
         def on_queue_complete(stats: QueueStats) -> None:
             """队列完成回调."""
@@ -267,6 +271,7 @@ class QueueController(QObject):
     task_progress = pyqtSignal(str, int)  # task_id, progress - 任务进度更新
     task_completed = pyqtSignal(str, str)  # task_id, output_path
     task_failed = pyqtSignal(str, str)  # task_id, error
+    task_cancelled = pyqtSignal(str)  # task_id
     all_completed = pyqtSignal(object)  # QueueStats
     error_occurred = pyqtSignal(object)  # Exception
 
@@ -353,6 +358,7 @@ class QueueController(QObject):
         self._worker.task_progress.connect(self._on_task_progress)
         self._worker.task_completed.connect(self._on_task_completed)
         self._worker.task_failed.connect(self._on_task_failed)
+        self._worker.task_cancelled.connect(self._on_task_cancelled)
         self._worker.queue_progress.connect(self._on_queue_progress)
         self._worker.queue_completed.connect(self._on_all_completed)
         self._worker.error_occurred.connect(self._on_error)
@@ -407,6 +413,10 @@ class QueueController(QObject):
     def _on_task_failed(self, task_id: str, error: str) -> None:
         """任务失败回调."""
         self.task_failed.emit(task_id, error)
+
+    def _on_task_cancelled(self, task_id: str) -> None:
+        """任务取消回调."""
+        self.task_cancelled.emit(task_id)
 
     def _on_queue_progress(self, stats: QueueStats) -> None:
         """队列进度回调."""

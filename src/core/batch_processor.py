@@ -57,6 +57,8 @@ class BatchProcessor:
         image_service: Optional[ImageService] = None,
         config: Optional[ProcessConfig] = None,
         concurrent_limit: int = 3,
+        # 是否自动重试失败任务szh
+        auto_retry_failed_tasks: bool = False,
     ) -> None:
         """初始化批量处理器.
 
@@ -71,6 +73,7 @@ class BatchProcessor:
         self._is_cancelled = False
         self._is_paused = False
         self._pause_event: Optional[asyncio.Event] = None  # 延迟创建
+        self._auto_retry_failed_tasks = auto_retry_failed_tasks
 
     @property
     def image_service(self) -> ImageService:
@@ -179,8 +182,9 @@ class BatchProcessor:
             # 并发执行所有任务
             await asyncio.gather(*tasks, return_exceptions=True)
 
-            # 检查是否需要重试失败的任务
-            await self._retry_failed_tasks(on_progress, on_task_complete)
+            # 按配置决定是否自动重试失败任务
+            if self._auto_retry_failed_tasks:
+                await self._retry_failed_tasks(on_progress, on_task_complete)
 
         except Exception as e:
             logger.exception(f"批量处理异常: {e}")
@@ -245,6 +249,13 @@ class BatchProcessor:
                     stats = self._queue.get_stats()
                     on_progress(task_id, progress, message, stats)
 
+            async def wait_if_paused() -> None:
+                """在处理阶段边界等待恢复，并响应取消."""
+                if self._pause_event:
+                    await self._pause_event.wait()
+                if self._is_cancelled:
+                    raise asyncio.CancelledError()
+
             try:
                 task.mark_processing()
 
@@ -253,11 +264,15 @@ class BatchProcessor:
                     task=task,
                     config=task.config,
                     on_progress=task_progress,
+                    pause_check=wait_if_paused,
                 )
 
                 # process_task 已经更新了任务状态
                 logger.info(f"任务 {batch_task.queue_position} 完成: {result_task.output_path}")
 
+            except asyncio.CancelledError:
+                task.mark_cancelled()
+                logger.info(f"任务 {batch_task.queue_position} 已取消")
             except Exception as e:
                 error_msg = str(e)
                 task.mark_failed(error_msg)
@@ -315,8 +330,8 @@ class BatchProcessor:
         if self._pause_event:
             self._pause_event.set()  # 确保暂停的任务能够退出
         # 取消所有待处理的任务
-        for batch_task in self._tasks:
-            if batch_task.task.status == TaskStatus.PENDING:
+        for batch_task in self._queue.tasks:
+            if batch_task.task.status in (TaskStatus.PENDING, TaskStatus.PROCESSING):
                 batch_task.task.mark_cancelled()
         logger.info("批量处理已取消")
 

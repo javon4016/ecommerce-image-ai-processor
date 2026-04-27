@@ -39,6 +39,7 @@ class ToolbarQueueProgress(QWidget):
         self._failed_tasks = 0
         self._is_processing = False
         self._is_paused = False
+        self._ui_phase: str = ""
         self._elapsed_seconds = 0
         
         # 计时器
@@ -114,7 +115,11 @@ class ToolbarQueueProgress(QWidget):
             else:
                 self._status_label.setText("等待")
         else:
-            if self._is_paused:
+            if self._ui_phase == "pausing":
+                self._status_label.setText("暂停中")
+            elif self._ui_phase == "cancelling":
+                self._status_label.setText("取消中")
+            elif self._is_paused:
                 self._status_label.setText("已暂停")
             else:
                 self._status_label.setText("处理中")
@@ -169,16 +174,23 @@ class ToolbarQueueProgress(QWidget):
         self._total_tasks = count
         self._update_display()
 
-    def set_processing_state(self, is_processing: bool, is_paused: bool = False) -> None:
+    def set_processing_state(
+        self,
+        is_processing: bool,
+        is_paused: bool = False,
+        ui_phase: str = "",
+    ) -> None:
         """设置处理状态.
 
         Args:
             is_processing: 是否正在处理
-            is_paused: 是否已暂停
+            is_paused: 是否已暂停（真正停住后的暂停态）
+            ui_phase: 过渡阶段文案，取值为 "" / "pausing" / "cancelling"
         """
         was_processing = self._is_processing
         self._is_processing = is_processing
         self._is_paused = is_paused
+        self._ui_phase = ui_phase if is_processing else ""
 
         if is_processing and not was_processing:
             # 开始处理
@@ -188,10 +200,10 @@ class ToolbarQueueProgress(QWidget):
             # 停止处理
             self._timer.stop()
         elif is_processing and is_paused:
-            # 暂停
+            # 已暂停（计时暂停）
             self._timer.stop()
         elif is_processing and not is_paused and was_processing:
-            # 继续
+            # 继续，或从「暂停中」过渡回处理中
             self._timer.start(1000)
 
         self._update_display()
@@ -215,6 +227,7 @@ class ToolbarQueueProgress(QWidget):
         self._failed_tasks = 0
         self._is_processing = False
         self._is_paused = False
+        self._ui_phase = ""
         self._elapsed_seconds = 0
         self._timer.stop()
         self._update_display()

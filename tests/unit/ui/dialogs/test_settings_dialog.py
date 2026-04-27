@@ -254,6 +254,7 @@ class TestSettingsDialog:
             default_output_width=800,
             default_output_height=800,
             default_output_quality=95,
+            concurrent_limit=3,
         )
         mock_config._load_user_config.return_value = {}
         mock_get_config.return_value = mock_config
@@ -280,6 +281,7 @@ class TestSettingsDialog:
             default_output_width=800,
             default_output_height=800,
             default_output_quality=95,
+            concurrent_limit=3,
         )
         mock_config._load_user_config.return_value = {}
         mock_get_config.return_value = mock_config
@@ -303,6 +305,7 @@ class TestSettingsDialog:
             default_output_width=800,
             default_output_height=800,
             default_output_quality=95,
+            concurrent_limit=3,
         )
         mock_config._load_user_config.return_value = {}
         mock_get_config.return_value = mock_config
@@ -310,10 +313,12 @@ class TestSettingsDialog:
         dialog = SettingsDialog()
         qtbot.addWidget(dialog)
 
-        assert dialog._tab_widget.count() == 3
-        assert dialog._tab_widget.tabText(0) == "通用"
-        assert dialog._tab_widget.tabText(1) == "输出"
-        assert dialog._tab_widget.tabText(2) == "路径"
+        assert dialog._tab_widget.count() == 5
+        assert dialog._tab_widget.tabText(0) == "AI 服务"
+        assert dialog._tab_widget.tabText(1) == "抠图服务"
+        assert dialog._tab_widget.tabText(2) == "通用"
+        assert dialog._tab_widget.tabText(3) == "输出"
+        assert dialog._tab_widget.tabText(4) == "路径"
 
     @patch("src.ui.dialogs.settings_dialog.get_config")
     def test_load_settings(self, mock_get_config, qtbot):
@@ -327,6 +332,7 @@ class TestSettingsDialog:
             default_output_width=1200,
             default_output_height=900,
             default_output_quality=80,
+            concurrent_limit=3,
         )
         mock_config._load_user_config.return_value = {
             "default_output_dir": "/test/output"
@@ -357,6 +363,7 @@ class TestSettingsDialog:
             default_output_width=800,
             default_output_height=800,
             default_output_quality=95,
+            concurrent_limit=3,
         )
         mock_config._load_user_config.return_value = {}
         mock_get_config.return_value = mock_config
@@ -387,6 +394,7 @@ class TestSettingsDialog:
             default_output_width=800,
             default_output_height=800,
             default_output_quality=95,
+            concurrent_limit=3,
         )
         mock_config._load_user_config.return_value = {}
         mock_get_config.return_value = mock_config
@@ -417,6 +425,7 @@ class TestSettingsDialog:
             default_output_width=800,
             default_output_height=800,
             default_output_quality=95,
+            concurrent_limit=3,
         )
         mock_config._load_user_config.return_value = {}
         mock_get_config.return_value = mock_config
@@ -443,6 +452,7 @@ class TestSettingsDialog:
             default_output_width=800,
             default_output_height=800,
             default_output_quality=95,
+            concurrent_limit=3,
         )
         mock_config._load_user_config.return_value = {}
         mock_config.save_user_config.side_effect = Exception("Save error")
@@ -455,6 +465,37 @@ class TestSettingsDialog:
             result = dialog._save_settings()
 
         assert result is False
+
+    @patch("src.ui.dialogs.settings_dialog.get_config")
+    def test_save_settings_allows_empty_api_key(self, mock_get_config, qtbot):
+        """测试保存设置允许清空 API Key."""
+        mock_config = MagicMock()
+        mock_config.settings = MagicMock(
+            log_level="INFO",
+            max_queue_size=3,
+            debug=False,
+            dev_tools=False,
+            default_output_width=800,
+            default_output_height=800,
+            default_output_quality=95,
+            concurrent_limit=3,
+        )
+        mock_config._load_user_config.return_value = {}
+        mock_get_config.return_value = mock_config
+
+        dialog = SettingsDialog()
+        qtbot.addWidget(dialog)
+
+        dialog._ai_widget._api_key_input.setText("")
+        dialog._save_settings()
+
+        mock_config.set_user_config.assert_any_call(
+            "api_config",
+            {
+                "api_key": "",
+                "model": {"model": dialog._ai_widget._model_combo.currentText()},
+            },
+        )
 
     @patch("src.ui.dialogs.settings_dialog.get_config")
     @patch.object(QMessageBox, "question")
@@ -471,6 +512,7 @@ class TestSettingsDialog:
             default_output_width=800,
             default_output_height=800,
             default_output_quality=95,
+            concurrent_limit=3,
         )
         mock_config._load_user_config.return_value = {}
         mock_get_config.return_value = mock_config
@@ -498,6 +540,7 @@ class TestSettingsDialog:
             default_output_width=800,
             default_output_height=800,
             default_output_quality=95,
+            concurrent_limit=3,
         )
         mock_config._load_user_config.return_value = {}
         mock_get_config.return_value = mock_config
@@ -521,6 +564,7 @@ class TestSettingsDialog:
             default_output_width=800,
             default_output_height=800,
             default_output_quality=95,
+            concurrent_limit=3,
         )
         mock_config._load_user_config.return_value = {}
         mock_get_config.return_value = mock_config

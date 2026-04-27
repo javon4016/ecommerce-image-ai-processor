@@ -9,6 +9,7 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QApplication, QMessageBox
 
 from src.models.image_task import ImageTask
+from src.models.process_config import BackgroundRemovalProvider, ProcessConfig
 from src.ui.main_window import MainWindow
 from src.utils.constants import (
     APP_NAME,
@@ -275,6 +276,8 @@ class TestPublicMethods:
         assert main_window._action_pause.isEnabled()
         # 取消应该可用
         assert main_window._action_cancel.isEnabled()
+        # 避免夹具销毁时触发退出确认弹窗
+        main_window.set_processing_state(False)
 
     def test_set_processing_state_paused(self, main_window):
         """测试设置暂停状态."""
@@ -284,6 +287,8 @@ class TestPublicMethods:
         assert main_window.is_paused
         # 暂停按钮文字应该变成"继续"
         assert "继续" in main_window._action_pause.text()
+        # 避免夹具销毁时触发退出确认弹窗
+        main_window.set_processing_state(False)
 
     def test_set_processing_state_stop(self, main_window):
         """测试设置停止状态."""
@@ -385,6 +390,8 @@ class TestSlots:
                 mock_question.return_value = QMessageBox.StandardButton.Yes
                 main_window._on_cancel_watch_timeout()
                 mock_kill.assert_called_once_with(0)
+        # 避免夹具销毁时触发退出确认弹窗
+        main_window.set_processing_state(False)
 
     def test_on_start_process_block_when_ai_unavailable(self, main_window):
         """测试 AI 不可用时阻止需要 AI 的任务启动."""
@@ -401,6 +408,20 @@ class TestSlots:
                     mock_warning.assert_called_once()
                     assert "AI服务不可用，请检查设置后重试" in mock_warning.call_args.args[2]
                     mock_start.assert_not_called()
+
+    def test_task_needs_ai_with_ai_background_provider(self, main_window):
+        """测试 AI 抠图提供者会触发 AI 依赖判断."""
+        task = ImageTask(image_paths=["a.jpg"])
+        config = ProcessConfig(
+            background={"enabled": True},
+            background_removal={
+                "enabled": True,
+                "provider": BackgroundRemovalProvider.AI,
+            },
+            ai_editing={"enabled": False},
+        )
+
+        assert main_window._task_needs_ai(task, config) is True
 
 
 # ========================

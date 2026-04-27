@@ -19,7 +19,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import os
 from enum import Enum, auto
 from pathlib import Path
@@ -833,7 +832,7 @@ class MainWindow(QMainWindow):
         if (
             config.background.enabled
             and config.background_removal.enabled
-            and config.background_removal.provider == "ai"
+            and config.background_removal.provider.value == "ai"
         ):
             return True
 
@@ -861,14 +860,11 @@ class MainWindow(QMainWindow):
             return False
 
         try:
-            # 尝试按当前设置构建配置并更新单例，确保至少是可解析配置
+            # 只做快速本地校验：配置可解析且服务实例可构建。
+            # 避免在 UI 线程中同步执行网络健康检查导致卡顿。
             model_data = api_config_data.get("model") or {"model": "qwen-image-edit-plus"}
             api_config = APIConfig(api_key=api_key, model=model_data)
-            ai_service = get_ai_service(config=api_config)
-            # 进一步做一次健康检查，捕获「key 错误但非空」场景
-            is_healthy = asyncio.run(ai_service.provider.health_check())
-            if not is_healthy:
-                raise RuntimeError("AI 服务健康检查失败")
+            get_ai_service(config=api_config)
             return True
         except Exception:
             QMessageBox.warning(

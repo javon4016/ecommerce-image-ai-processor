@@ -394,29 +394,35 @@ class ImageService:
                 await pause_check()
             report_progress(52, "抠图处理中")
             # 保存临时文件用于抠图
-            import tempfile
-            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-                tmp.write(composite_result)
-                tmp_path = tmp.name
-            
-            composite_result = await self._remove_scene_background(
-                tmp_path,
-                config,
-                lambda p, m: report_progress(int(52 + p * 0.08), m),
-            )
-            
-            if pause_check:
-                await pause_check()
-            report_progress(62, "背景填充")
-            composite_result = await self._apply_background_to_scene(
-                composite_result,
-                config,
-                lambda p, m: report_progress(int(62 + p * 0.03), m),
-            )
-            
-            # 清理临时文件
             import os
-            os.unlink(tmp_path)
+            import tempfile
+
+            tmp_path = ""
+            try:
+                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+                    tmp.write(composite_result)
+                    tmp_path = tmp.name
+
+                composite_result = await self._remove_scene_background(
+                    tmp_path,
+                    config,
+                    lambda p, m: report_progress(int(52 + p * 0.08), m),
+                )
+
+                if pause_check:
+                    await pause_check()
+                report_progress(62, "背景填充")
+                composite_result = await self._apply_background_to_scene(
+                    composite_result,
+                    config,
+                    lambda p, m: report_progress(int(62 + p * 0.03), m),
+                )
+            finally:
+                if tmp_path:
+                    try:
+                        os.unlink(tmp_path)
+                    except FileNotFoundError:
+                        pass
         else:
             report_progress(65, "跳过抠图和背景填充")
 
@@ -710,11 +716,7 @@ class ImageService:
             
         except Exception as e:
             logger.error(f"AI 多图合成失败: {e}")
-            # 失败时返回第一张图片
-            logger.warning("回退到第一张图片")
-            if on_progress:
-                on_progress(100, "回退到第一张图片")
-            return images_bytes[0]
+            raise ImageProcessError(f"AI 多图合成失败: {e}") from e
 
     async def _remove_scene_background(
         self,

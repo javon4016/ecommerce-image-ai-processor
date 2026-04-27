@@ -367,8 +367,11 @@ class AISettingsWidget(QWidget):
 class BackgroundRemovalSettingsWidget(QWidget):
     """抠图服务设置面板."""
 
+    connection_test_finished = pyqtSignal(str, str)  # level, message
+
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
+        self.connection_test_finished.connect(self._on_connection_test_finished)
         self._setup_ui()
 
     def _setup_ui(self) -> None:
@@ -533,28 +536,37 @@ class BackgroundRemovalSettingsWidget(QWidget):
         self._test_btn.setEnabled(False)
         self._test_btn.setText("正在测试...")
 
-        try:
-            import httpx
-            # 同步测试连接
-            with httpx.Client(timeout=10) as client:
-                response = client.options(api_url)
-                if response.status_code in (200, 204, 405):
-                    QMessageBox.information(
-                        self, "测试通过",
-                        f"API 服务可达\n状态码: {response.status_code}"
-                    )
-                else:
-                    QMessageBox.warning(
-                        self, "测试警告",
-                        f"服务可连接但返回状态码: {response.status_code}"
-                    )
-        except httpx.ConnectError:
-            QMessageBox.critical(self, "测试失败", f"无法连接到: {api_url}")
-        except Exception as e:
-            QMessageBox.critical(self, "测试失败", f"连接失败: {e}")
-        finally:
-            self._test_btn.setEnabled(True)
-            self._test_btn.setText("测试连接")
+        import threading
+
+        def worker() -> None:
+            try:
+                import httpx
+                with httpx.Client(timeout=10) as client:
+                    response = client.options(api_url)
+                    if response.status_code in (200, 204, 405):
+                        self.connection_test_finished.emit(
+                            "info", f"API 服务可达\n状态码: {response.status_code}"
+                        )
+                    else:
+                        self.connection_test_finished.emit(
+                            "warning", f"服务可连接但返回状态码: {response.status_code}"
+                        )
+            except Exception as e:
+                self.connection_test_finished.emit("error", f"连接失败: {e}")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_connection_test_finished(self, level: str, message: str) -> None:
+        """处理异步连接测试结果."""
+        if level == "info":
+            QMessageBox.information(self, "测试通过", message)
+        elif level == "warning":
+            QMessageBox.warning(self, "测试警告", message)
+        else:
+            QMessageBox.critical(self, "测试失败", message)
+
+        self._test_btn.setEnabled(True)
+        self._test_btn.setText("测试连接")
 
     def get_settings(self) -> dict:
         """获取当前设置."""
@@ -837,15 +849,15 @@ class SettingsDialog(QDialog):
             all_settings = {**general, **output, **path}
             self._config_manager.save_user_config(all_settings)
 
-            # 保存 AI 配置
-            if ai.get("api_key"):
-                api_config_data = {
-                    "api_key": ai["api_key"],
-                    "model": {"model": ai.get("model", "qwen-image-edit-plus")}
-                }
-                self._config_manager.set_user_config("api_config", api_config_data)
+            # 保存 AI 配置（允许空 key，支持用户清空已保存凭据）
+            api_config_data = {
+                "api_key": ai.get("api_key", ""),
+                "model": {"model": ai.get("model", "qwen-image-edit-plus")}
+            }
+            self._config_manager.set_user_config("api_config", api_config_data)
 
-                # 更新 AI 服务单例
+            # 仅在 key 非空时更新 AI 服务单例
+            if ai.get("api_key"):
                 try:
                     api_config = APIConfig(
                         api_key=ai["api_key"],

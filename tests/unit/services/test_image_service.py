@@ -76,6 +76,10 @@ def mock_ai_service(sample_result_bytes: bytes) -> MagicMock:
     mock = MagicMock(spec=AIService)
     mock.remove_background = AsyncMock(return_value=sample_result_bytes)
     mock.composite_product = AsyncMock(return_value=sample_result_bytes)
+    mock.edit_image = AsyncMock(return_value=sample_result_bytes)
+    mock.generate_background = AsyncMock(return_value=sample_result_bytes)
+    mock.provider = MagicMock()
+    mock.provider.composite_images = AsyncMock(return_value=sample_result_bytes)
     return mock
 
 
@@ -325,6 +329,32 @@ class TestProcessTask:
 
         assert result.status == TaskStatus.FAILED
         assert result.error_message is not None
+
+    @pytest.mark.asyncio
+    async def test_process_task_multi_image_failure(
+        self,
+        image_service: ImageService,
+        sample_image_path: Path,
+        sample_background_path: Path,
+    ) -> None:
+        """测试多图任务在 AI 合成失败时标记为失败."""
+        image_service.ai_service.provider.composite_images = AsyncMock(
+            side_effect=AIServiceError("多图合成失败")
+        )
+        task = ImageTask(
+            image_paths=[str(sample_background_path), str(sample_image_path)],
+            config=ProcessConfig(
+                background={"enabled": False},
+                border={"enabled": False},
+                text={"enabled": False},
+                ai_editing={"enabled": False},
+            ),
+        )
+
+        result = await image_service.process_task(task)
+
+        assert result.status == TaskStatus.FAILED
+        assert "AI 多图合成失败" in (result.error_message or "")
 
 
 # ===================

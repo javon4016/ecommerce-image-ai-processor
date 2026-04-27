@@ -19,6 +19,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import os
 from enum import Enum, auto
 from pathlib import Path
 from typing import Optional
@@ -149,9 +151,9 @@ class MainWindow(QMainWindow):
         self._queue_count: int = 0
         self._current_progress: int = 0
 
-        # 暂停：当前步骤结束后才切换到「已暂停」展示，避免与进度条冲突
+        # 暂停：轮询后端是否真正停住，避免 UI 提前显示「已暂停」
         self._pause_settle_timer = QTimer(self)
-        self._pause_settle_timer.setSingleShot(True)
+        self._pause_settle_timer.setInterval(200)
         self._pause_settle_timer.timeout.connect(self._on_pause_settled)
         # 取消：长时间未结束时提示强制结束
         self._cancel_watch_timer = QTimer(self)
@@ -784,10 +786,22 @@ class MainWindow(QMainWindow):
         """协作式暂停：当前阶段结束后将 UI 切到「已暂停」，避免与进度条冲突."""
         if self._run_state != ProcessingRunState.PAUSING:
             return
+        if self._queue_controller and not self._queue_controller.is_paused:
+            return
+        self._pause_settle_timer.stop()
         self._set_run_state(
             ProcessingRunState.PAUSED,
             status_message="已暂停（点击「继续」恢复处理）",
         )
+
+    def _kill_process_and_exit(self, exit_code: int = 0) -> None:
+        """硬退出应用进程，避免 UI 卡死."""
+        try:
+            app = QApplication.instance()
+            if app:
+                app.quit()
+        finally:
+            os._exit(exit_code)
 
     def _on_cancel_watch_timeout(self) -> None:
         """取消长时间未结束时提示强制结束."""
@@ -802,7 +816,67 @@ class MainWindow(QMainWindow):
             QMessageBox.StandardButton.No,
         )
         if reply == QMessageBox.StandardButton.Yes:
-            self._force_stop_processing(reason="用户确认强制结束")
+            logger.error("取消超时后用户选择强制结束，应用将立即退出")
+            self._kill_process_and_exit(0)
+
+    def _task_needs_ai(self, task: ImageTask, config: ProcessConfig) -> bool:
+        """判断任务是否依赖 AI 服务."""
+        # 多图任务一定需要 AI 合成
+        if task.image_count > 1:
+            return True
+
+        # 单图启用 AI 增强时需要 AI
+        if config.ai_editing.enabled:
+            return True
+
+        # 启用抠图且使用 AI 抠图提供者时需要 AI
+        if (
+            config.background.enabled
+            and config.background_removal.enabled
+            and config.background_removal.provider == "ai"
+        ):
+            return True
+
+        return False
+
+    def _ensure_ai_service_available(
+        self,
+        tasks: dict[str, ImageTask],
+        config: ProcessConfig,
+    ) -> bool:
+        """若任务依赖 AI，则在启动前校验 AI 服务配置是否可用."""
+        needs_ai = any(self._task_needs_ai(task, config) for task in tasks.values())
+        if not needs_ai:
+            return True
+
+        config_manager = get_config()
+        api_config_data = config_manager.get_user_config("api_config", {})
+        api_key = str(api_config_data.get("api_key", "")).strip()
+        if not api_key:
+            QMessageBox.warning(
+                self,
+                "AI服务不可用",
+                "AI服务不可用，请检查设置后重试",
+            )
+            return False
+
+        try:
+            # 尝试按当前设置构建配置并更新单例，确保至少是可解析配置
+            model_data = api_config_data.get("model") or {"model": "qwen-image-edit-plus"}
+            api_config = APIConfig(api_key=api_key, model=model_data)
+            ai_service = get_ai_service(config=api_config)
+            # 进一步做一次健康检查，捕获「key 错误但非空」场景
+            is_healthy = asyncio.run(ai_service.provider.health_check())
+            if not is_healthy:
+                raise RuntimeError("AI 服务健康检查失败")
+            return True
+        except Exception:
+            QMessageBox.warning(
+                self,
+                "AI服务不可用",
+                "AI服务不可用，请检查设置后重试",
+            )
+            return False
 
     def _force_stop_processing(
         self,
@@ -843,9 +917,17 @@ class MainWindow(QMainWindow):
             self._action_start.setEnabled(has_queue and idle_like)
 
         if self._action_pause:
-            if st in (ProcessingRunState.PROCESSING, ProcessingRunState.PAUSED):
+            if st in (
+                ProcessingRunState.PROCESSING,
+                ProcessingRunState.PAUSING,
+                ProcessingRunState.PAUSED,
+            ):
                 self._action_pause.setEnabled(True)
-                self._action_pause.setText("继续" if st == ProcessingRunState.PAUSED else "暂停")
+                self._action_pause.setText(
+                    "继续"
+                    if st in (ProcessingRunState.PAUSING, ProcessingRunState.PAUSED)
+                    else "暂停"
+                )
             else:
                 self._action_pause.setEnabled(False)
                 self._action_pause.setText("暂停")
@@ -1076,9 +1158,18 @@ class MainWindow(QMainWindow):
                 self._current_progress,
                 "暂停中（当前步骤完成后将暂停）",
             )
-            self._pause_settle_timer.start(1200)
+            self._pause_settle_timer.start()
             self.process_paused.emit()
             logger.info("请求暂停（协作式）")
+        elif self._run_state == ProcessingRunState.PAUSING:
+            # 用户在“暂停中”时点继续，撤销暂停请求
+            self._pause_settle_timer.stop()
+            self._queue_controller.resume()
+            self._set_run_state(
+                ProcessingRunState.PROCESSING,
+                status_message="正在处理...",
+            )
+            logger.info("暂停中取消暂停请求，继续处理")
         else:
             logger.debug("忽略暂停：当前状态 %s", self._run_state)
 
@@ -1450,6 +1541,11 @@ class MainWindow(QMainWindow):
             return
 
         current_config = self._collect_current_config()
+        if not self._ensure_ai_service_available(tasks, current_config):
+            self.show_status_message("AI服务不可用，请检查设置后重试")
+            logger.warning("AI 服务不可用，已阻止启动需要 AI 的任务")
+            return
+
         for task in tasks.values():
             task.config = current_config
 

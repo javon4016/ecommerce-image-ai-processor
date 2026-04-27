@@ -587,11 +587,7 @@ class ImageService:
             
         except Exception as e:
             logger.error(f"AI 增强失败: {e}")
-            # 失败时返回原图
-            logger.warning("回退到原图")
-            if on_progress:
-                on_progress(100, "回退到原图")
-            return image_bytes
+            raise ImageProcessError(f"AI 增强失败: {e}") from e
 
     async def _simple_composite(
         self,

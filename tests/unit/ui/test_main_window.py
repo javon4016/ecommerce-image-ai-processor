@@ -6,8 +6,9 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from PyQt6.QtCore import Qt
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QMessageBox
 
+from src.models.image_task import ImageTask
 from src.ui.main_window import MainWindow
 from src.utils.constants import (
     APP_NAME,
@@ -373,6 +374,33 @@ class TestSlots:
         # 调用应该直接返回，不做任何操作
         main_window._on_clear_queue()
         assert main_window.queue_count == 0
+
+    def test_on_cancel_watch_timeout_yes_kill_process(self, main_window):
+        """测试取消超时确认后触发硬退出路径."""
+        from src.ui.main_window import ProcessingRunState
+
+        main_window._run_state = ProcessingRunState.CANCELLING
+        with patch("src.ui.main_window.QMessageBox.question") as mock_question:
+            with patch.object(main_window, "_kill_process_and_exit") as mock_kill:
+                mock_question.return_value = QMessageBox.StandardButton.Yes
+                main_window._on_cancel_watch_timeout()
+                mock_kill.assert_called_once_with(0)
+
+    def test_on_start_process_block_when_ai_unavailable(self, main_window):
+        """测试 AI 不可用时阻止需要 AI 的任务启动."""
+        task = ImageTask(image_paths=["a.jpg", "b.jpg"])
+        main_window._tasks[task.id] = task
+        main_window.update_queue_count(1)
+
+        fake_config = MagicMock()
+        fake_config.get_user_config.return_value = {}
+        with patch("src.ui.main_window.get_config", return_value=fake_config):
+            with patch("src.ui.main_window.QMessageBox.warning") as mock_warning:
+                with patch.object(main_window._queue_controller, "start") as mock_start:
+                    main_window._on_start_process()
+                    mock_warning.assert_called_once()
+                    assert "AI服务不可用，请检查设置后重试" in mock_warning.call_args.args[2]
+                    mock_start.assert_not_called()
 
 
 # ========================
